@@ -36,7 +36,7 @@ const SURF_POINTS_ABI = [
   // Claim & Withdraw
   "function claimSurfPoints() external",
   "function withdrawClaim(uint256 _claimId) external",
-  "function batchWithdrawClaims(uint256[] calldata _claimIds) external",
+  "function skipClaimRewards() external",
 
   // Token Management
   "function depositSurfToken(uint256 _amount) external",
@@ -59,6 +59,8 @@ const SURF_POINTS_ABI = [
   "function getWithdrawableClaims(address _user) external view returns (uint256[] memory)",
   "function getContractBalance() external view returns (uint256)",
   "function getContractStats() external view returns (uint256 totalDistributed, uint256 totalClaimed, uint256 contractBalance)",
+  "function getAllUsersClaimStatus() external view returns (address[] memory claimedUsers, uint256[] memory claimedAmounts, address[] memory pendingUsers, uint256[] memory pendingAmounts)",
+  "function getTotalUsersCount() external view returns (uint256)",
 
   // Contract Info
   "function version() external pure returns (string memory)",
@@ -68,9 +70,13 @@ const SURF_POINTS_ABI = [
 
   // Public State Variables
   "function userSurfPoints(address user) external view returns (uint256)",
+  "function hasSkippedClaim(address user) external view returns (bool)",
   "function userClaimCount(address user) external view returns (uint256)",
+  "function userTotalClaimed(address user) external view returns (uint256)",
   "function totalPointsDistributed() external view returns (uint256)",
-  "function totalTokensClaimed() external view returns (uint256)"
+  "function totalTokensClaimed() external view returns (uint256)",
+  "function allUsers(uint256 index) external view returns (address)",
+  "function isUserTracked(address user) external view returns (bool)"
 ];
 
 const ERC20_ABI = [
@@ -160,12 +166,22 @@ async function userClaimFlow() {
       return;
     }
 
-    // Claim points (creates 14-day vesting)
+    // Check if user has skipped before
+    const hasSkipped = await contractAsUser.hasSkippedClaim(userWallet.address);
+    if (hasSkipped) {
+      console.log("   ⚠️ User has skip enabled. Disable skip first to claim.");
+      console.log("   Call skipClaimRewards() to toggle skip off.");
+      return;
+    }
+
+    // Claim points (creates vesting with configurable lock period)
     console.log("\n2. Claiming points...");
     const tx = await contractAsUser.claimSurfPoints();
     const receipt = await tx.wait();
     console.log("   ✅ Claim request created!");
-    console.log("   Tokens will be available in 14 days");
+
+    const lockPeriod = await contractAsUser.claimLockPeriod();
+    console.log(`   Tokens will be available in ${Number(lockPeriod) / 86400} days`);
 
     // Get claim info
     const userInfo = await contractAsUser.getUserInfo(userWallet.address);
@@ -185,6 +201,68 @@ async function userClaimFlow() {
     }
 
     console.log("\n✅ Claim flow completed!\n");
+  } catch (error) {
+    console.error("❌ Error:", error.message);
+  }
+}
+
+// ========== USER FLOW - SKIP (TOGGLE) ==========
+
+async function userSkipFlow() {
+  console.log("\n========== USER SKIP FLOW (TOGGLE) ==========\n");
+
+  try {
+    // Check current skip status
+    const hasSkipped = await contractAsUser.hasSkippedClaim(userWallet.address);
+    console.log("1. Current skip status:", hasSkipped ? "ENABLED" : "DISABLED");
+
+    // Check if already claimed
+    const claimCount = await contractAsUser.userClaimCount(userWallet.address);
+    if (claimCount > 0) {
+      console.log("   ⚠️ Cannot toggle skip - user has already claimed before");
+      return;
+    }
+
+    if (!hasSkipped) {
+      // Enabling skip
+      const points = await contractAsUser.getUserPoints(userWallet.address);
+      console.log("   Available points:", points.toString());
+
+      if (points.toString() === "0") {
+        console.log("   ⚠️ No points to skip");
+        return;
+      }
+
+      console.log("\n2. Enabling skip (forfeiting points)...");
+      console.log("   ⚠️ WARNING: This will forfeit", points.toString(), "points!");
+      console.log("   You can toggle skip off later to claim again.");
+
+      const tx = await contractAsUser.skipClaimRewards();
+      await tx.wait();
+      console.log("   ✅ Skip enabled! Points forfeited.");
+
+      // Verify status
+      const hasSkippedNow = await contractAsUser.hasSkippedClaim(userWallet.address);
+      const remainingPoints = await contractAsUser.getUserPoints(userWallet.address);
+      console.log("\n3. Updated status:");
+      console.log("   Skip enabled:", hasSkippedNow);
+      console.log("   Remaining points:", remainingPoints.toString());
+    } else {
+      // Disabling skip
+      console.log("\n2. Disabling skip...");
+      console.log("   This will allow you to claim rewards again.");
+
+      const tx = await contractAsUser.skipClaimRewards();
+      await tx.wait();
+      console.log("   ✅ Skip disabled! You can now claim rewards.");
+
+      // Verify status
+      const hasSkippedNow = await contractAsUser.hasSkippedClaim(userWallet.address);
+      console.log("\n3. Updated status:");
+      console.log("   Skip enabled:", hasSkippedNow);
+    }
+
+    console.log("\n✅ Skip flow completed!\n");
   } catch (error) {
     console.error("❌ Error:", error.message);
   }
@@ -223,19 +301,13 @@ async function userWithdrawFlow() {
 
     console.log("   ✅ Found", withdrawableIds.length, "withdrawable claims");
 
-    // Withdraw single claim
-    console.log("\n2. Withdrawing claim", withdrawableIds[0].toString(), "...");
-    const tx = await contractAsUser.withdrawClaim(withdrawableIds[0]);
-    await tx.wait();
-    console.log("   ✅ Tokens withdrawn!");
-
-    // If multiple claims, batch withdraw the rest
-    if (withdrawableIds.length > 1) {
-      console.log("\n3. Batch withdrawing remaining claims...");
-      const remainingIds = withdrawableIds.slice(1);
-      const tx2 = await contractAsUser.batchWithdrawClaims(remainingIds);
-      await tx2.wait();
-      console.log("   ✅ Batch withdrawal complete!");
+    // Withdraw claims one by one
+    console.log("\n2. Withdrawing claims...");
+    for (let i = 0; i < withdrawableIds.length; i++) {
+      const claimId = withdrawableIds[i];
+      const tx = await contractAsUser.withdrawClaim(claimId);
+      await tx.wait();
+      console.log(`   ✅ Claim ${claimId} withdrawn!`);
     }
 
     console.log("\n✅ Withdraw flow completed!\n");
@@ -350,7 +422,88 @@ async function readFunctions() {
     console.log("  Total Points Distributed:", totalDistributed.toString());
     console.log("  Total Tokens Claimed:", totalClaimed.toString());
 
+    // Get total users count
+    const totalUsers = await contractAsUser.getTotalUsersCount();
+    console.log("\nUser Tracking:");
+    console.log("  Total Tracked Users:", totalUsers.toString());
+
     console.log("\n✅ Read complete!\n");
+  } catch (error) {
+    console.error("❌ Error:", error.message);
+  }
+}
+
+// ========== GET ALL USERS CLAIM STATUS ==========
+
+async function getAllUsersClaimStatus() {
+  console.log("\n========== ALL USERS CLAIM STATUS ==========\n");
+
+  try {
+    const result = await contractAsUser.getAllUsersClaimStatus();
+    const { claimedUsers, claimedAmounts, pendingUsers, pendingAmounts } = result;
+
+    console.log("📊 Users Who Have Claimed Rewards:");
+    if (claimedUsers.length === 0) {
+      console.log("   No users have claimed yet.");
+    } else {
+      for (let i = 0; i < claimedUsers.length; i++) {
+        console.log(`   ${i + 1}. ${claimedUsers[i]}`);
+        console.log(`      Total Claimed: ${claimedAmounts[i].toString()} SURF`);
+      }
+    }
+
+    console.log("\n⏳ Users With Pending Rewards:");
+    if (pendingUsers.length === 0) {
+      console.log("   No users have pending rewards.");
+    } else {
+      for (let i = 0; i < pendingUsers.length; i++) {
+        console.log(`   ${i + 1}. ${pendingUsers[i]}`);
+        console.log(`      Pending Amount: ${pendingAmounts[i].toString()} SURF`);
+      }
+    }
+
+    console.log("\n📈 Summary:");
+    console.log(`   Total Users Who Claimed: ${claimedUsers.length}`);
+    console.log(`   Total Users With Pending: ${pendingUsers.length}`);
+    
+    const totalClaimed = claimedAmounts.reduce((sum, amount) => sum + BigInt(amount), 0n);
+    const totalPending = pendingAmounts.reduce((sum, amount) => sum + BigInt(amount), 0n);
+    console.log(`   Total Claimed: ${totalClaimed.toString()} SURF`);
+    console.log(`   Total Pending: ${totalPending.toString()} SURF`);
+
+    console.log("\n✅ Status check complete!\n");
+  } catch (error) {
+    console.error("❌ Error:", error.message);
+  }
+}
+
+// ========== GET USER TOTAL CLAIMED ==========
+
+async function getUserTotalClaimed(userAddress) {
+  console.log(`\n========== USER TOTAL CLAIMED: ${userAddress} ==========\n`);
+
+  try {
+    const totalClaimed = await contractAsUser.userTotalClaimed(userAddress);
+    const pendingPoints = await contractAsUser.getUserPoints(userAddress);
+    const claimCount = await contractAsUser.userClaimCount(userAddress);
+
+    console.log("User Statistics:");
+    console.log(`   Total Claimed (All Time): ${totalClaimed.toString()} SURF`);
+    console.log(`   Pending Points: ${pendingPoints.toString()} SURF`);
+    console.log(`   Total Claims Made: ${claimCount.toString()}`);
+
+    if (claimCount > 0) {
+      const pendingClaims = await contractAsUser.getPendingClaims(userAddress);
+      console.log(`\n   Pending Claims: ${pendingClaims.claimIds.length}`);
+      for (let i = 0; i < pendingClaims.claimIds.length; i++) {
+        const unlockDate = new Date(Number(pendingClaims.unlockTimes[i]) * 1000);
+        console.log(`     Claim ${pendingClaims.claimIds[i]}: ${pendingClaims.amounts[i]} SURF`);
+        console.log(`       Unlocks: ${unlockDate.toISOString()}`);
+        console.log(`       Can Withdraw: ${pendingClaims.canWithdraw[i]}`);
+      }
+    }
+
+    console.log("\n✅ User info retrieved!\n");
   } catch (error) {
     console.error("❌ Error:", error.message);
   }
@@ -383,10 +536,13 @@ async function main() {
   // 2. POINTS DISTRIBUTION (Admin operation)
   // await adminFlow();           // Admin records points for users
 
-  // 3. USER CLAIM (User operation)
-  // await userClaimFlow();       // User initiates claim (starts 14-day vesting)
+  // 3A. USER CLAIM (User operation - choose claim OR skip)
+  // await userClaimFlow();       // User initiates claim (starts vesting)
 
-  // 4. USER WITHDRAW (User operation - after 14 days)
+  // 3B. USER SKIP (User operation - toggle skip on/off)
+  // await userSkipFlow();        // User toggles skip feature (can enable/disable)
+
+  // 4. USER WITHDRAW (User operation - after lock period)
   await userWithdrawFlow();    // User withdraws tokens after lock period
 
   // 5. EMERGENCY OPERATIONS (Owner only)
@@ -394,6 +550,12 @@ async function main() {
 
   // 6. VIEW CONTRACT STATE (Anyone)
   await readFunctions();       // Read contract information
+
+  // 7. VIEW ALL USERS STATUS (Anyone)
+  // await getAllUsersClaimStatus();  // Get all users' claim status
+
+  // 8. VIEW SPECIFIC USER TOTAL CLAIMED (Anyone)
+  // await getUserTotalClaimed(userWallet.address);  // Get specific user's total claimed
 
   console.log("========================================\n");
 }

@@ -55,10 +55,22 @@ contract SurfPoints is
     /// @notice Total surf tokens claimed by users
     uint256 public totalTokensClaimed;
 
+    /// @notice Mapping to track if user has chosen to skip claims (toggleable)
+    mapping(address => bool) public hasSkippedClaim;
+
+    /// @notice Mapping to track total tokens claimed per user (sum of all withdrawn claims)
+    mapping(address => uint256) public userTotalClaimed;
+
+    /// @notice Array to track all users who have interacted with the contract
+    address[] public allUsers;
+
+    /// @notice Mapping to track if a user is already in the allUsers array
+    mapping(address => bool) public isUserTracked;
+
     // ============ Storage Gap ============
 
-    /// @dev Reserved storage space for future upgrades (48 slots)
-    uint256[48] private __gap;
+    /// @dev Reserved storage space for future upgrades (44 slots)
+    uint256[44] private __gap;
 
     // ============ Events ============
 
@@ -67,6 +79,7 @@ contract SurfPoints is
     event SurfPointsRecorded(address indexed user, uint256 points, uint256 newBalance);
     event ClaimRequested(address indexed user, uint256 indexed claimId, uint256 amount, uint256 unlockTime);
     event ClaimWithdrawn(address indexed user, uint256 indexed claimId, uint256 amount);
+    event ClaimSkipped(address indexed user, uint256 pointsForfeited, bool skipEnabled);
     event ClaimLockPeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
     event SurfTokenDeposited(address indexed depositor, uint256 amount);
     event SurfTokenWithdrawn(address indexed recipient, uint256 amount);
@@ -87,6 +100,8 @@ contract SurfPoints is
     error ClaimStillLocked();
     error ClaimAlreadyWithdrawn();
     error InvalidLockPeriod();
+    error AlreadyClaimed();
+    error CannotSkipAfterClaim();
 
     // ============ Modifiers ============
 
@@ -175,6 +190,12 @@ contract SurfPoints is
         if (_user == address(0)) revert ZeroAddress();
         if (_points == 0) revert ZeroAmount();
 
+        // Track user if not already tracked
+        if (!isUserTracked[_user]) {
+            allUsers.push(_user);
+            isUserTracked[_user] = true;
+        }
+
         userSurfPoints[_user] += _points;
         totalPointsDistributed += _points;
 
@@ -197,6 +218,12 @@ contract SurfPoints is
             if (_users[i] == address(0)) revert ZeroAddress();
             if (_points[i] == 0) revert ZeroAmount();
 
+            // Track user if not already tracked
+            if (!isUserTracked[_users[i]]) {
+                allUsers.push(_users[i]);
+                isUserTracked[_users[i]] = true;
+            }
+
             userSurfPoints[_users[i]] += _points[i];
             totalPointsDistributed += _points[i];
 
@@ -206,12 +233,15 @@ contract SurfPoints is
 
     /**
      * @notice Allows users to claim their accumulated surf points
-     * @dev Creates a claim request with 14-day lock period
+     * @dev Creates a claim request with lock period (configurable)
      *      Resets user's point balance to 0
      *      Users can claim multiple times as admin adds new points
-     *      Tokens can be withdrawn after 14 days using withdrawClaim()
+     *      Tokens can be withdrawn after lock period using withdrawClaim()
+     *      Cannot claim if user has previously chosen to skip
      */
     function claimSurfPoints() external whenNotPaused nonReentrant {
+        if (hasSkippedClaim[msg.sender]) revert NotAuthorized();
+
         uint256 points = userSurfPoints[msg.sender];
 
         if (points == 0) revert NoPointsToClaim();
@@ -252,6 +282,7 @@ contract SurfPoints is
         // Update state before transfer (Checks-Effects-Interactions pattern)
         claim.withdrawn = true;
         totalTokensClaimed += amount;
+        userTotalClaimed[msg.sender] += amount;
 
         // Transfer SURF tokens to user (1:1 ratio with points)
         surfToken.safeTransfer(msg.sender, amount);
@@ -260,28 +291,28 @@ contract SurfPoints is
     }
 
     /**
-     * @notice Allows users to withdraw multiple claims at once
-     * @param _claimIds Array of claim IDs to withdraw
+     * @notice Allows users to toggle skip claim feature
+     * @dev When enabling skip: forfeits current points, user cannot claim while skip is enabled
+     *      When disabling skip: allows user to claim again in the future
+     *      Cannot toggle skip if user has already claimed before
+     *      This is a toggle - users can enable/disable skip as needed
      */
-    function batchWithdrawClaims(uint256[] calldata _claimIds) external whenNotPaused nonReentrant {
-        for (uint256 i = 0; i < _claimIds.length; i++) {
-            uint256 claimId = _claimIds[i];
+    function skipClaimRewards() external whenNotPaused nonReentrant {
+        if (userClaimCount[msg.sender] > 0) revert CannotSkipAfterClaim();
 
-            if (claimId >= userClaimCount[msg.sender]) continue;
+        bool currentlySkipped = hasSkippedClaim[msg.sender];
+        uint256 points = userSurfPoints[msg.sender];
 
-            ClaimRequest storage claim = claimRequests[msg.sender][claimId];
-
-            if (claim.withdrawn) continue;
-            if (block.timestamp < claim.claimTime + claimLockPeriod) continue;
-
-            uint256 amount = claim.amount;
-
-            claim.withdrawn = true;
-            totalTokensClaimed += amount;
-
-            surfToken.safeTransfer(msg.sender, amount);
-
-            emit ClaimWithdrawn(msg.sender, claimId, amount);
+        if (!currentlySkipped) {
+            // Enabling skip: forfeit current points
+            if (points == 0) revert NoPointsToClaim();
+            hasSkippedClaim[msg.sender] = true;
+            userSurfPoints[msg.sender] = 0;
+            emit ClaimSkipped(msg.sender, points, true);
+        } else {
+            // Disabling skip: allow claiming again
+            hasSkippedClaim[msg.sender] = false;
+            emit ClaimSkipped(msg.sender, 0, false);
         }
     }
 
@@ -560,6 +591,75 @@ contract SurfPoints is
             totalTokensClaimed,
             surfToken.balanceOf(address(this))
         );
+    }
+
+    /**
+     * @notice Gets all users with their claim status
+     * @return claimedUsers Array of users who have claimed rewards
+     * @return claimedAmounts Array of total claimed amounts for each user
+     * @return pendingUsers Array of users who have pending rewards to claim
+     * @return pendingAmounts Array of pending reward amounts for each user
+     * @dev This function iterates through all tracked users and categorizes them
+     */
+    function getAllUsersClaimStatus()
+        external
+        view
+        returns (
+            address[] memory claimedUsers,
+            uint256[] memory claimedAmounts,
+            address[] memory pendingUsers,
+            uint256[] memory pendingAmounts
+        )
+    {
+        uint256 totalUsers = allUsers.length;
+        uint256 claimedCount = 0;
+        uint256 pendingCount = 0;
+
+        // First pass: count users in each category
+        for (uint256 i = 0; i < totalUsers; i++) {
+            address user = allUsers[i];
+            if (userTotalClaimed[user] > 0) {
+                claimedCount++;
+            } else if (userSurfPoints[user] > 0) {
+                pendingCount++;
+            }
+        }
+
+        // Initialize arrays
+        claimedUsers = new address[](claimedCount);
+        claimedAmounts = new uint256[](claimedCount);
+        pendingUsers = new address[](pendingCount);
+        pendingAmounts = new uint256[](pendingCount);
+
+        // Second pass: populate arrays
+        uint256 claimedIndex = 0;
+        uint256 pendingIndex = 0;
+
+        for (uint256 i = 0; i < totalUsers; i++) {
+            address user = allUsers[i];
+            uint256 claimed = userTotalClaimed[user];
+            uint256 pending = userSurfPoints[user];
+
+            if (claimed > 0) {
+                claimedUsers[claimedIndex] = user;
+                claimedAmounts[claimedIndex] = claimed;
+                claimedIndex++;
+            } else if (pending > 0) {
+                pendingUsers[pendingIndex] = user;
+                pendingAmounts[pendingIndex] = pending;
+                pendingIndex++;
+            }
+        }
+
+        return (claimedUsers, claimedAmounts, pendingUsers, pendingAmounts);
+    }
+
+    /**
+     * @notice Gets the total number of tracked users
+     * @return Total count of users who have interacted with the contract
+     */
+    function getTotalUsersCount() external view returns (uint256) {
+        return allUsers.length;
     }
 
     // ============ UUPS Upgrade Authorization ============
